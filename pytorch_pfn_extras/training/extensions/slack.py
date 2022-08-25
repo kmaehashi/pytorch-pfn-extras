@@ -115,8 +115,11 @@ class _SlackBase(extension.Extension):
         self._filenames: Optional[Union[_FilenamesFunc, Sequence[str]]] = None
         self._upload_trigger: Optional[trigger_module.Trigger] = None
 
-    def _post_message(self, text: str) -> None:
+    def _post_message(self, text: str) -> Optional[str]:
         raise NotImplementedError
+
+    def _post_or_edit_message(self, text: str) -> None:
+        self._post_message(text)
 
     def _upload_files(self, filenames: Sequence[str]) -> Sequence[str]:
         raise NotImplementedError
@@ -187,7 +190,7 @@ class _SlackBase(extension.Extension):
             permalinks = self._upload_files(filenames)
             attachments = ''.join([f'<{link}| >' for link in permalinks])
 
-        self._post_message(text + attachments)
+        self._post_or_edit_message(text + attachments)
 
     def initialize(self, manager: ExtensionsManagerProtocol) -> None:
         if not self._available or self._start_msg is None:
@@ -251,6 +254,9 @@ class Slack(_SlackBase):
         thread (bool): When True, subsequent messages will be
             posted as a thread of the original message.
             Default is ``True``.
+        inplace (bool): When True, `msg` will be posted only once, and the
+            subsequent updates will modify that message.
+            Default is ``False``.
         filenames (list of str or callable): A list of files that will
             be uploaded. These are string templates that can take
             values in the same way as ``msg``, or a callable that returns a
@@ -259,6 +265,7 @@ class Slack(_SlackBase):
             If not specified, files will be uploaded in every call.
         context: Any arbitrary user object you will need when
             generating a message.
+            Default is an empty ``dict``.
         token (str): Slack bot token. If ``None``, the environment
             variable ``SLACK_BOT_TOKEN`` will be used.
             Optional, default is ``None``.
@@ -275,6 +282,7 @@ class Slack(_SlackBase):
         end_msg: Optional[Union[str, _MessageFunc]] = '{default}',
         error_msg: Optional[Union[str, _ErrorMessageFunc]] = '{default}',
         thread: bool = True,
+        inplace: bool = False,
         filenames: Optional[Union[Sequence[str], _FilenamesFunc]] = None,
         upload_trigger: Optional[TriggerLike] = None,
         context: Any = None,
@@ -287,6 +295,11 @@ class Slack(_SlackBase):
                 '`slack_sdk` package is unavailable. '
                 'The Slack extension will do nothing.')
             return
+        if context is None:
+            # Provide an empty dict by default for users' convenience (e.g.
+            # so that users can use it to accumulate messages when using
+            # `inplace` option).
+            context = {}
 
         self._channel = channel
         self._msg = msg
@@ -295,6 +308,7 @@ class Slack(_SlackBase):
         self._error_msg = error_msg
         self._context = context
         self._thread = thread
+        self._inplace = inplace
         self._filenames = filenames
         self._upload_trigger = None
         if upload_trigger is not None:
@@ -306,6 +320,7 @@ class Slack(_SlackBase):
             raise RuntimeError(
                 'A bot `token` is needed for communicating with Slack')
         self._client = slack_sdk.WebClient(token=token)
+        self._msg_ts: Optional[str] = None
         self._thread_ts: Optional[str] = None
 
     def _upload_files(self, filenames: Sequence[str]) -> Sequence[str]:
@@ -321,7 +336,7 @@ class Slack(_SlackBase):
                 f'[{filenames}]')
         return permalinks
 
-    def _post_message(self, text: str) -> None:
+    def _post_message(self, text: str) -> Optional[str]:
         try:
             response = self._client.chat_postMessage(
                 channel=self._channel,
@@ -329,12 +344,30 @@ class Slack(_SlackBase):
                 thread_ts=self._thread_ts,
             )
             assert response.get("ok")  # type: ignore[no-untyped-call]
+            ts = response.get("ts")  # type: ignore[no-untyped-call]
             if self._thread and self._thread_ts is None:
-                ts = response.get("ts")  # type: ignore[no-untyped-call]
                 self._thread_ts = ts
+            return ts
         except Exception as e:
             warnings.warn(
-                f'Slack post failed: {type(e).__name__}: {e} '
+                f'Slack message post failed: {type(e).__name__}: {e} '
+                f'[{text}]')
+        return None
+
+    def _post_or_edit_message(self, text: str) -> None:
+        if not self._inplace or self._msg_ts is None:
+            self._msg_ts = self._post_message(text)
+            return
+        try:
+            response = self._client.chat_update(
+                channel=self._channel,
+                text=text,
+                ts=self._msg_ts,
+            )
+            assert response.get("ok")  # type: ignore[no-untyped-call]
+        except Exception as e:
+            warnings.warn(
+                f'Slack message update failed: {type(e).__name__}: {e} '
                 f'[{text}]')
 
 
@@ -382,7 +415,7 @@ class SlackWebhook(_SlackBase):
         self._error_msg = error_msg
         self._context = context
 
-    def _post_message(self, text: str) -> None:
+    def _post_message(self, text: str) -> Optional[str]:
         payload = json.dumps({'text': text}).encode('utf-8')
         request_headers = {'Content-Type': 'application/json; charset=utf-8'}
         request = urllib.request.Request(
